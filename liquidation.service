@@ -1,0 +1,13 @@
+[Unit]
+Description=Crypto Liquidation Alert Bot
+After=network.target
+
+[Service]
+ExecStart=/bin/bash /root/liqalert/run.sh
+WorkingDirectory=/root/liqalert
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
