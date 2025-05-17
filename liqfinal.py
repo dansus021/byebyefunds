@@ -13,8 +13,8 @@ from telegram import Bot
 import random
 
 # Configuration
-TELEGRAM_BOT_TOKEN = "7924295389:AAE9jEGbOlaxYseZiOdM-OqjFhKrzZToxbI"
-TELEGRAM_CHANNEL_ID = "@byebyefunds"
+TELEGRAM_BOT_TOKEN = "YOUR TELEGRAM BOT TOKEN"
+TELEGRAM_CHANNEL_ID = "@YOURCHANNEL"
 
 # Liquidation thresholds (in USD)
 MINIMUM_AMOUNT_USD = 50000         # Regular liquidation
