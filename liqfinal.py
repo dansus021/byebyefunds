@@ -24,6 +24,7 @@ MEGA_WHALE_THRESHOLD_USD = 1000000 # Mega whale liquidation
 # WebSocket URLs
 BINANCE_WS_URL = "wss://fstream.binance.com/stream?streams=!forceOrder@arr"
 BYBIT_WSS_URL = "wss://stream.bybit.com/v5/public/linear"
+OKX_WSS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 BYBIT_REST_API = "https://api.bybit.com"
 
 # Initialize Telegram bot
@@ -257,9 +258,21 @@ def format_liquidation_message(exchange, inner, category):
             ts = datetime.fromtimestamp(int(inner.get("t", time.time())) / 1000)
             symbol = inner.get("symbol", "?")
             side = inner.get("side", "").lower()
-            is_long = (side == "sell")
+            is_long = (side == "sell") # For Bybit, 'sell' side means long liquidation
             price = float(inner.get("price", inner.get("p", 0)))
             qty = float(inner.get("size", inner.get("qty", 0)))
+        elif exchange == 'OKX':
+            # Timestamp from OKX is in milliseconds
+            ts_ms_str = inner.get("ts", "0")
+            ts = datetime.fromtimestamp(int(ts_ms_str) / 1000)
+            symbol = inner.get("symbol", "?") # This is instId from on_okx_message
+            # In on_okx_message, inner_data_for_formatter["side"] is detail.get("side")
+            # For OKX: side of liquidation order: "sell" means a long position was liquidated.
+            # "buy" means a short position was liquidated.
+            okx_side = inner.get("side", "").lower()
+            is_long = (okx_side == "sell")
+            price = float(inner.get("price", 0)) # This is fillPx from on_okx_message
+            qty = float(inner.get("qty", 0))     # This is fillSz from on_okx_message
         else:
             return None
 
@@ -312,6 +325,61 @@ def on_binance_message(ws, msg):
                 send_telegram_message(message)
     except Exception as e:
         logger.error(f"❌ Binance msg err: {e}")
+
+# -------------------- OKX Handler --------------------
+
+def on_okx_message(ws, msg):
+    try:
+        payload = json.loads(msg)
+        # Check if it's a liquidation event
+        if payload.get("arg", {}).get("channel") == "liquidation-orders" and "data" in payload:
+            for order_data in payload["data"]:
+                for detail in order_data.get("details", []):
+                    # Assuming contract value is 1 for USDT-margined contracts
+                    # For coin-margined, this calculation would be different (qty * contract_val / price)
+                    # Price should be bankruptcy price, quantity is size of liquidation order
+                    price = float(detail.get("bkPx", 0)) # Corrected to bkPx
+                    qty = float(detail.get("sz", 0))     # Corrected to sz
+                    
+                    val = price * qty # For USDT margined contracts where sz is in base currency
+                    
+                    # OKX provides contract value for inverse contracts (e.g. BTC-USD-SWAP) in 'ctVal'
+                    # instFamily can be like "BTC-USDT" for linear or "BTC-USD" for inverse
+                    # instId is like "BTC-USDT-SWAP"
+                    # uly (underlying) is like "BTC-USDT" or "BTC-USD"
+                    # For inverse contracts (e.g. BTC-USD-SWAP), value is qty * ctVal / price
+                    # For now, we'll assume linear contracts if not specified, or filter by instFamily if needed
+                    # This example primarily targets USDT-margined (linear) contracts based on common usage.
+
+                    if val < MINIMUM_AMOUNT_USD:
+                        continue
+                    
+                    category = 'regular'
+                    if val >= MEGA_WHALE_THRESHOLD_USD:
+                        category = 'mega'
+                    elif val >= WHALE_THRESHOLD_USD:
+                        category = 'whale'
+
+                    # Prepare data for format_liquidation_message
+                    # This structure should align with what format_liquidation_message expects
+                    # or format_liquidation_message needs to be adapted for OKX.
+                    inner_data_for_formatter = {
+                        "ts": detail.get("ts"), # OKX provides timestamp in ms
+                        "symbol": order_data.get("instId", "?"),
+                        # OKX: side of liquidation order: "buy" or "sell".
+                        # If actual position was long, liquidation order is "sell".
+                        # If actual position was short, liquidation order is "buy".
+                        "side": detail.get("side"), 
+                        "price": price,
+                        "qty": qty
+                    }
+                    
+                    message = format_liquidation_message('OKX', inner_data_for_formatter, category)
+                    if message:
+                        send_telegram_message(message)
+
+    except Exception as e:
+        logger.error(f"❌ OKX msg err: {e}, raw_message: {msg[:200]}")
 
 # -------------------- Bybit Monitor --------------------
 
@@ -408,13 +476,35 @@ def connect_binance():
     threading.Thread(target=ws.run_forever, daemon=True).start()
     return ws
 
+def connect_okx():
+    """Initializes and starts the WebSocket connection to OKX."""
+    def on_okx_open(ws_app):
+        logger.info("OKX WebSocket opened, subscribing to liquidation orders...")
+        sub_msg = {
+            "op": "subscribe",
+            "args": [{"channel": "liquidation-orders", "instType": "ANY"}]
+        }
+        ws_app.send(json.dumps(sub_msg))
+
+    ws_okx = websocket.WebSocketApp(
+        OKX_WSS_URL,
+        on_open=on_okx_open,
+        on_message=on_okx_message,
+        on_error=lambda ws, e: logger.error(f"❌ OKX WS err: {e}"),
+        on_close=lambda ws, code, msg: logger.warning(f"⚠️ OKX WS closed: {code} - {msg}")
+    )
+    # Start the WebSocket connection in a separate thread with ping/pong
+    threading.Thread(target=lambda: ws_okx.run_forever(ping_interval=20, ping_timeout=10), daemon=True).start()
+    logger.info("OKX WebSocket connection thread started.")
+    return ws_okx
+
 if __name__ == '__main__':
     logger.info("🚀 Starting Multi-Exchange Liquidation Alert Service")
     # Notify startup
     bot.send_message(
         chat_id=TELEGRAM_CHANNEL_ID,
         text=(
-            f"🚀 <b>{BRAND_EMOJI} {CHANNEL_NAME} Live on Binance & Bybit!</b> 🚀\n"
+            f"🚀 <b>{BRAND_EMOJI} {CHANNEL_NAME} Live on Binance, Bybit & OKX!</b> 🚀\n"
             f"Started at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
         ),
         parse_mode="HTML"
@@ -424,6 +514,7 @@ if __name__ == '__main__':
     connect_binance()
     bybit_monitor = BybitLiquidationMonitor()
     bybit_monitor.start()
+    connect_okx() # Start OKX connection
 
     # Keepalive and reconnect schedule
     schedule.every(6).hours.do(connect_binance)
